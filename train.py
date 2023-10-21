@@ -112,7 +112,8 @@ def extend_cfg(cfg):
     cfg.TRAINER.DOCOOP.LAMBDA_MI = 0.4
     cfg.TRAINER.DOCOOP.CSC = False  # class-specific context
     cfg.TRAINER.DOCOOP.CLASS_TOKEN_POSITION = "end"  # 'middle' or 'end' or 'front'
-
+    cfg.TRAINER.DOCOOP.ADJUST_WEIGHT = False
+    
     cfg.TRAINER.DOCOCOOP = CN()
     cfg.TRAINER.DOCOCOOP.N_CTX = 3  # number of context vectors
     cfg.TRAINER.DOCOCOOP.CTX_INIT = ""  # initialization words

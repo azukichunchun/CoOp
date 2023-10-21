@@ -33,7 +33,7 @@ TRAINER:
     CTX_INIT: "a photo of a"
     LAMBDA_OT: 4.0
     LAMBDA_MI: 0.4
-    ADJUST_WEIGHT: FALSE
+    ADJUST_WEIGHT: True
 
 DATASET:
   SUBSAMPLE_CLASSES: all

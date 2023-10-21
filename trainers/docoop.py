@@ -18,6 +18,7 @@ from dassl.utils import (
 )
 
 from sklearn_extra.cluster import KMedoids
+from sklearn.linear_model import LinearRegression
 from mmd import MMD_loss
 
 from clip import clip
@@ -247,7 +248,16 @@ class DoCoOp(TrainerX):
         
         # MMD
         self.mmd = MMD_loss()
-        
+
+        # LinearRegression
+        lr = LinearRegression()
+        points = np.array([[1, self.cfg.TRAINER.DOCOOP.LAMBDA_OT],
+                           [16, 0.01]])
+        X = points[:, 0].reshape(-1, 1)
+        Y = points[:, 1]
+        self.lr = lr.fit(X, Y)
+        self.ot_weight = self.lr.predict([[self.cfg.DATASET.NUM_SHOTS]])[0]
+
         super().__init__(cfg)
         
       
@@ -403,21 +413,27 @@ class DoCoOp(TrainerX):
             ot_loss = self.compute_transport_loss(logits_scaled_c, logits_c)
             mi_loss = self.compute_im_loss(logits_scaled_c)
             
-            distribution_loss = self.cfg.TRAINER.DOCOOP.LAMBDA_OT * ot_loss + self.cfg.TRAINER.DOCOOP.LAMBDA_MI * mi_loss
+            # distribution_loss = self.cfg.TRAINER.DOCOOP.LAMBDA_OT * ot_loss + self.cfg.TRAINER.DOCOOP.LAMBDA_MI * mi_loss
             # images_c = images_c[0]
             # images_c = torch.unsqueeze(images_c, dim=0)
-            # distribution_loss_list = []
-            # for image_c in images_c:
-            #     image_c = torch.unsqueeze(image_c, dim=0)
-            #     image_features_c, text_features_c = self.model(image_c)
-            #     logits_c = image_features_c @ text_features_c.t()
-            #     logits_scaled_c = logit_scale * logits_c
+            distribution_loss_list = []
+            for image_c in images_c:
+                image_c = torch.unsqueeze(image_c, dim=0)
+                image_features_c, text_features_c = self.model(image_c)
+                logits_c = image_features_c @ text_features_c.t()
+                logits_scaled_c = logit_scale * logits_c
             
-            #     ot_loss = self.compute_transport_loss(logits_scaled_c, logits_c)
-            #     mi_loss = self.compute_im_loss(logits_scaled_c)
+                ot_loss = self.compute_transport_loss(logits_scaled_c, logits_c)
+                mi_loss = self.compute_im_loss(logits_scaled_c)
                 
-            #     distribution_loss_list.append(self.cfg.TRAINER.DOCOOP.LAMBDA_OT * ot_loss + self.cfg.TRAINER.DOCOOP.LAMBDA_MI * mi_loss)
-            # distribution_loss = min(distribution_loss_list)
+                if self.cfg.TRAINER.DOCOOP.ADJUST_WEIGHT:
+                    # calculate weight from num_shots
+                    distribution_loss_list.append(self.ot_weight * ot_loss + 0.1 * self.ot_weight * mi_loss)
+                else:
+                    distribution_loss_list.append(self.cfg.TRAINER.DOCOOP.LAMBDA_OT * ot_loss + self.cfg.TRAINER.DOCOOP.LAMBDA_MI * mi_loss)
+                    
+            
+            distribution_loss = max(distribution_loss_list)
             
             # image_features_c, text_features_c = self.model(images_c)
             
