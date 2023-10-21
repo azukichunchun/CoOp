@@ -23,8 +23,13 @@ import datasets.imagenetv2
 import datasets.imagenet_a
 import datasets.imagenet_r
 
+import datasets.isic
+import datasets.chestxray
+
 import trainers.coop
 import trainers.cocoop
+import trainers.docoop
+import trainers.dococoop
 import trainers.zsclip
 
 
@@ -99,13 +104,29 @@ def extend_cfg(cfg):
     cfg.TRAINER.COCOOP.CTX_INIT = ""  # initialization words
     cfg.TRAINER.COCOOP.PREC = "fp16"  # fp16, fp32, amp
 
-    cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
+    cfg.TRAINER.DOCOOP = CN()
+    cfg.TRAINER.DOCOOP.N_CTX = 3  # number of context vectors
+    cfg.TRAINER.DOCOOP.CTX_INIT = ""  # initialization words
+    cfg.TRAINER.DOCOOP.PREC = "fp16"  # fp16, fp32, amp
+    cfg.TRAINER.DOCOOP.LAMBDA_OT = 4.0
+    cfg.TRAINER.DOCOOP.LAMBDA_MI = 0.4
+    cfg.TRAINER.DOCOOP.CSC = False  # class-specific context
+    cfg.TRAINER.DOCOOP.CLASS_TOKEN_POSITION = "end"  # 'middle' or 'end' or 'front'
 
+    cfg.TRAINER.DOCOCOOP = CN()
+    cfg.TRAINER.DOCOCOOP.N_CTX = 3  # number of context vectors
+    cfg.TRAINER.DOCOCOOP.CTX_INIT = ""  # initialization words
+    cfg.TRAINER.DOCOCOOP.PREC = "fp16"  # fp16, fp32, amp
+    cfg.TRAINER.DOCOCOOP.LAMBDA_OT = 4.0
+    cfg.TRAINER.DOCOCOOP.LAMBDA_MI = 0.4
+    cfg.TRAINER.DOCOCOOP.CSC = False  # class-specific context
+    cfg.TRAINER.DOCOCOOP.CLASS_TOKEN_POSITION = "end"  # 'middle' or 'end' or 'front'
+
+    cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
 
 def setup_cfg(args):
     cfg = get_cfg_default()
     extend_cfg(cfg)
-
     # 1. From the dataset config file
     if args.dataset_config_file:
         cfg.merge_from_file(args.dataset_config_file)
@@ -140,7 +161,6 @@ def main(args):
     print("** System info **\n{}\n".format(collect_env_info()))
 
     trainer = build_trainer(cfg)
-
     if args.eval_only:
         trainer.load_model(args.model_dir, epoch=args.load_epoch)
         trainer.test()

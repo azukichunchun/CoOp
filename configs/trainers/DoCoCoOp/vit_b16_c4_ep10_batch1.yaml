@@ -30,6 +30,6 @@ MODEL:
 
 TRAINER:
   COCOOP:
-    N_CTX: 8
+    N_CTX: 4
     CTX_INIT: ""
     PREC: "fp16"

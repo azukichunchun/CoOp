@@ -18,7 +18,7 @@ OPTIM:
   MAX_EPOCH: 10
   LR_SCHEDULER: "cosine"
   WARMUP_EPOCH: 1
-  WARMUP_TYPE: "None"
+  WARMUP_TYPE: "constant"
   WARMUP_CONS_LR: 1e-5
 
 TRAIN:

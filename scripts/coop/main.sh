@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # custom config
-DATA=/path/to/datasets
+DATA=data
 TRAINER=CoOp
 
 DATASET=$1
@@ -17,7 +17,20 @@ do
     if [ -d "$DIR" ]; then
         echo "Oops! The results exist at ${DIR} (so skip this job)"
     else
-        python train.py \
+        echo   CUDA_VISIBLE_DEVICES=0 python train.py \
+        --root ${DATA} \
+        --seed ${SEED} \
+        --trainer ${TRAINER} \
+        --dataset-config-file configs/datasets/${DATASET}.yaml \
+        --config-file configs/trainers/${TRAINER}/${CFG}.yaml \
+        --output-dir ${DIR} \
+        TRAINER.COOP.N_CTX ${NCTX} \
+        TRAINER.COOP.CSC ${CSC} \
+        TRAINER.COOP.CLASS_TOKEN_POSITION ${CTP} \
+        DATASET.NUM_SHOTS ${SHOTS}
+
+        
+        CUDA_VISIBLE_DEVICES=0 python train.py \
         --root ${DATA} \
         --seed ${SEED} \
         --trainer ${TRAINER} \

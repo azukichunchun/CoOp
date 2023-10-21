@@ -1,7 +1,11 @@
 import os.path as osp
 from collections import OrderedDict
 import math
-
+import time
+import copy
+import pdb
+from tqdm import tqdm
+import datetime
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -9,11 +13,14 @@ from torch.cuda.amp import GradScaler, autocast
 
 from dassl.engine import TRAINER_REGISTRY, TrainerX
 from dassl.metrics import compute_accuracy
-from dassl.utils import load_pretrained_weights, load_checkpoint
+from dassl.utils import (
+    MetricMeter, AverageMeter, load_checkpoint, load_pretrained_weights
+)
 from dassl.optim import build_optimizer, build_lr_scheduler
 
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
+from .transforms import get_tuning_transform
 
 _tokenizer = _Tokenizer()
 
@@ -63,8 +70,8 @@ class PromptLearner(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         n_cls = len(classnames)
-        n_ctx = cfg.TRAINER.COCOOP.N_CTX
-        ctx_init = cfg.TRAINER.COCOOP.CTX_INIT
+        n_ctx = cfg.TRAINER.DOCOCOOP.N_CTX
+        ctx_init = cfg.TRAINER.DOCOCOOP.CTX_INIT
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
         vis_dim = clip_model.visual.output_dim
@@ -86,19 +93,19 @@ class PromptLearner(nn.Module):
             ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
             nn.init.normal_(ctx_vectors, std=0.02)
             prompt_prefix = " ".join(["X"] * n_ctx)
-
+        
         print(f'Initial context: "{prompt_prefix}"')
         print(f"Number of context words (tokens): {n_ctx}")
 
         self.ctx = nn.Parameter(ctx_vectors)
-
+        
         self.meta_net = nn.Sequential(OrderedDict([
             ("linear1", nn.Linear(vis_dim, vis_dim // 16)),
             ("relu", nn.ReLU(inplace=True)),
             ("linear2", nn.Linear(vis_dim // 16, ctx_dim))
         ]))
         
-        if cfg.TRAINER.COCOOP.PREC == "fp16":
+        if cfg.TRAINER.DOCOCOOP.PREC == "fp16":
             self.meta_net.half()
 
         classnames = [name.replace("_", " ") for name in classnames]
@@ -170,35 +177,103 @@ class CustomCLIP(nn.Module):
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
+        self.cfg = cfg
+        
+    def get_entropy(self, input_):
+        bs = input_.size(0)
+        epsilon = 1e-5
+        entropy = -input_ * torch.log(input_ + epsilon)
+        entropy = torch.sum(entropy, dim=1)
+        return entropy 
 
-    def forward(self, image, label=None):
+    def compute_im_loss(self, logits):
+        softmax_out = nn.Softmax(dim=1)(logits)
+        entropy_loss = torch.mean(self.get_entropy(softmax_out))
+        msoftmax = softmax_out.mean(dim=0)
+        gentropy_loss = torch.sum(-msoftmax * torch.log(msoftmax + 1e-6))
+        im_loss = entropy_loss - gentropy_loss
+        return im_loss
+
+    def compute_transport_loss(self, logits, sim_t):
+        s_dist = F.softmax(logits, dim=1)
+        t_dist = F.softmax(logits, dim=0)
+        cost = 1 - sim_t
+        s_cost = (cost * s_dist).sum(1).mean()
+        t_cost = (cost * t_dist).sum(0).mean()
+        return s_cost + t_cost
+    
+    def forward(self, image_n, image_c, label=None):
         tokenized_prompts = self.tokenized_prompts
         logit_scale = self.logit_scale.exp()
 
-        image_features = self.image_encoder(image.type(self.dtype))
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        image_features_c = self.image_encoder(image_c.type(self.dtype))
+        image_features_c = image_features_c / image_features_c.norm(dim=-1, keepdim=True)
 
-        prompts = self.prompt_learner(image_features)
+        image_features_n = self.image_encoder(image_n.type(self.dtype))
+        image_features_n = image_features_n / image_features_n.norm(dim=-1, keepdim=True)
+
+        prompts = self.prompt_learner(image_features_n)
         
         logits = []
-        for pts_i, imf_i in zip(prompts, image_features):
+        for pts_i, imf_i in zip(prompts, image_features_n):
             text_features = self.text_encoder(pts_i, tokenized_prompts)
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
             l_i = logit_scale * imf_i @ text_features.t()
             logits.append(l_i)
         logits = torch.stack(logits)
-        
+                
         if self.prompt_learner.training:
-            print("aaaaaaa")
-            return F.cross_entropy(logits, label)
+            # Cross-Entropy Loss
+            cross_entropy_loss = F.cross_entropy(logits, label)
+            
+            # Distribution loss
+            prompts = prompts[0]
+            text_features_c = self.text_encoder(prompts, tokenized_prompts)
+            text_features_c = text_features_c / text_features_c.norm(dim=-1, keepdim=True)
+            logits_c = image_features_c @ text_features_c.t()
+            logits_scaled_c = logit_scale * logits_c
+            
+            transfer_loss = self.compute_transport_loss(logits_scaled_c, logits_c)
+            mi_loss = self.compute_im_loss(logits_scaled_c)
+
+            loss = cross_entropy_loss + self.cfg.TRAINER.DOCOOP.LAMBDA_OT * transfer_loss + self.cfg.TRAINER.DOCOOP.LAMBDA_MI * mi_loss
+            return loss
         
         return logits
 
 
 @TRAINER_REGISTRY.register()
-class CoCoOp(TrainerX):
+class DoCoCoOp(TrainerX):
+    
+    def __init__(self, cfg):
+        self.check_cfg(cfg)
+
+        if torch.cuda.is_available() and cfg.USE_CUDA:
+            self.device = torch.device("cuda")
+        else:
+            self.device = torch.device("cpu")
+
+        # Save as attributes some frequently used variables
+        self.start_epoch = self.epoch = 0
+        self.max_epoch = cfg.OPTIM.MAX_EPOCH
+        self.output_dir = cfg.OUTPUT_DIR
+
+        self.cfg = cfg
+        self.build_data_loader()
+        
+        # Copy dataloader_x for data transform
+        self.train_loader_c = copy.deepcopy(self.train_loader_x)
+        transform_tune = get_tuning_transform()
+        self.train_loader_c.transform = transform_tune
+
+        # Copy dataloader_x for data transform
+        self.test_loader_c = copy.deepcopy(self.test_loader)
+        self.test_loader_c.transform = transform_tune
+        
+        super().__init__(cfg)
+        
     def check_cfg(self, cfg):
-        assert cfg.TRAINER.COCOOP.PREC in ["fp16", "fp32", "amp"]
+        assert cfg.TRAINER.DOCOCOOP.PREC in ["fp16", "fp32", "amp"]
 
     def build_model(self):
         cfg = self.cfg
@@ -207,7 +282,7 @@ class CoCoOp(TrainerX):
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
         
-        if cfg.TRAINER.COCOOP.PREC == "fp32" or cfg.TRAINER.COCOOP.PREC == "amp":
+        if cfg.TRAINER.DOCOCOOP.PREC == "fp32" or cfg.TRAINER.DOCOCOOP.PREC == "amp":
             # CLIP's default precision is fp16
             clip_model.float()
 
@@ -237,7 +312,7 @@ class CoCoOp(TrainerX):
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("prompt_learner", self.model.prompt_learner, self.optim, self.sched)
 
-        self.scaler = GradScaler() if cfg.TRAINER.COCOOP.PREC == "amp" else None
+        self.scaler = GradScaler() if cfg.TRAINER.DOCOCOOP.PREC == "amp" else None
 
         # Note that multi-gpu training could be slow because CLIP's size is
         # big, which slows down the copy operation in DataParallel
@@ -245,24 +320,66 @@ class CoCoOp(TrainerX):
         if device_count > 1:
             print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
             self.model = nn.DataParallel(self.model)
+    
+    def run_epoch(self):
+        self.set_model_mode("train")
+        losses = MetricMeter()
+        batch_time = AverageMeter()
+        data_time = AverageMeter()
+        self.num_batches = len(self.train_loader_x)
+
+        end = time.time()
+        for self.batch_idx, batch in enumerate(zip(self.train_loader_x, self.train_loader_c)):
+            data_time.update(time.time() - end)
+            loss_summary = self.forward_backward(batch)
+            batch_time.update(time.time() - end)
+            losses.update(loss_summary)
+
+            meet_freq = (self.batch_idx + 1) % self.cfg.TRAIN.PRINT_FREQ == 0
+            only_few_batches = self.num_batches < self.cfg.TRAIN.PRINT_FREQ
+            if meet_freq or only_few_batches:
+                nb_remain = 0
+                nb_remain += self.num_batches - self.batch_idx - 1
+                nb_remain += (
+                    self.max_epoch - self.epoch - 1
+                ) * self.num_batches
+                eta_seconds = batch_time.avg * nb_remain
+                eta = str(datetime.timedelta(seconds=int(eta_seconds)))
+
+                info = []
+                info += [f"epoch [{self.epoch + 1}/{self.max_epoch}]"]
+                info += [f"batch [{self.batch_idx + 1}/{self.num_batches}]"]
+                info += [f"time {batch_time.val:.3f} ({batch_time.avg:.3f})"]
+                info += [f"data {data_time.val:.3f} ({data_time.avg:.3f})"]
+                info += [f"{losses}"]
+                info += [f"lr {self.get_current_lr():.4e}"]
+                info += [f"eta {eta}"]
+                print(" ".join(info))
+
+            n_iter = self.epoch * self.num_batches + self.batch_idx
+            for name, meter in losses.meters.items():
+                self.write_scalar("train/" + name, meter.avg, n_iter)
+            self.write_scalar("train/lr", self.get_current_lr(), n_iter)
+
+            end = time.time()
 
     def forward_backward(self, batch):
-        image, label = self.parse_batch_train(batch)
+        images_n, labels_n, images_c, _ = self.parse_batch_train(batch)
 
         model = self.model
         optim = self.optim
         scaler = self.scaler
         
-        prec = self.cfg.TRAINER.COCOOP.PREC
+        prec = self.cfg.TRAINER.DOCOCOOP.PREC
         if prec == "amp":
             with autocast():
-                loss = model(image, label)
+                loss = model(images_n, images_c, labels_n)
             optim.zero_grad()
             scaler.scale(loss).backward()
             scaler.step(optim)
             scaler.update()
         else:
-            loss = model(image, label)
+            loss = model(images_n, images_c, labels_n)
             optim.zero_grad()
             loss.backward()
             optim.step()
@@ -275,11 +392,16 @@ class CoCoOp(TrainerX):
         return loss_summary
 
     def parse_batch_train(self, batch):
-        input = batch["img"]
-        label = batch["label"]
-        input = input.to(self.device)
-        label = label.to(self.device)
-        return input, label
+        batch_n, batch_c = batch
+        input_n = batch_n["img"]
+        label_n = batch_n["label"]
+        input_c = batch_c["img"]
+        label_c = batch_c["label"]
+        input_n = input_n.to(self.device)
+        label_n = label_n.to(self.device)
+        input_c = input_c.to(self.device)
+        label_c = label_c.to(self.device)
+        return input_n, label_n, input_c, label_c
 
     def load_model(self, directory, epoch=None):
         if not directory:
@@ -314,3 +436,36 @@ class CoCoOp(TrainerX):
             print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
             # set strict=False
             self._models[name].load_state_dict(state_dict, strict=False)
+
+    @torch.no_grad()
+    def test(self, split=None):
+        """A generic testing pipeline."""
+        self.set_model_mode("eval")
+        self.evaluator.reset()
+
+        if split is None:
+            split = self.cfg.TEST.SPLIT
+
+        if split == "val" and self.val_loader is not None:
+            data_loader = self.val_loader
+        else:
+            split = "test"  # in case val_loader is None
+            data_loader_n = self.test_loader
+            #data_loader_c = self.test_loader_c
+
+        print(f"Evaluate on the *{split}* set")
+
+        for batch_idx, batch in enumerate(tqdm(data_loader_n)):
+            images_n, labels_n = self.parse_batch_test(batch)
+            #import pdb;pdb.set_trace()
+            logits = self.model(images_n, images_n)
+            self.evaluator.process(logits, labels_n)
+
+        results = self.evaluator.evaluate()
+
+        for k, v in results.items():
+            tag = f"{split}/{k}"
+            self.write_scalar(tag, v, self.epoch)
+
+        return list(results.values())[0]
+    
