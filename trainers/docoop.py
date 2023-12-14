@@ -4,6 +4,7 @@ import pdb
 import copy
 from tqdm import tqdm
 import datetime
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -20,10 +21,15 @@ from dassl.utils import (
 from sklearn_extra.cluster import KMedoids
 from sklearn.linear_model import LinearRegression
 from mmd import MMD_loss
-
+from mixgen import mixgen_pt, mixgen_batch
+from sklearn.manifold import TSNE
+from scipy.sparse.csgraph import connected_components
+import matplotlib.pyplot as plt
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 from .transforms import get_tuning_transform
+
+from contrastive import Proximity, Con_Proximity
 
 _tokenizer = _Tokenizer()
 
@@ -31,7 +37,7 @@ def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
     url = clip._MODELS[backbone_name]
     model_path = clip._download(url)
-
+    
     try:
         # loading JIT archive
         model = torch.jit.load(model_path, map_location="cpu").eval()
@@ -60,7 +66,7 @@ class TextEncoder(nn.Module):
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
-
+        
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
@@ -76,6 +82,7 @@ class PromptLearner(nn.Module):
         ctx_init = cfg.TRAINER.DOCOOP.CTX_INIT
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
+        vis_dim = clip_model.visual.output_dim
         clip_imsize = clip_model.visual.input_resolution
         cfg_imsize = cfg.INPUT.SIZE[0]
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
@@ -120,6 +127,8 @@ class PromptLearner(nn.Module):
         self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
         self.register_buffer("token_suffix", embedding[:, 1 + n_ctx :, :])  # CLS, EOS
 
+        self.vis_dim = vis_dim
+        self.dtype = dtype
         self.n_cls = n_cls
         self.n_ctx = n_ctx
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
@@ -134,61 +143,14 @@ class PromptLearner(nn.Module):
         prefix = self.token_prefix
         suffix = self.token_suffix
 
-        if self.class_token_position == "end":
-            prompts = torch.cat(
-                [
-                    prefix,  # (n_cls, 1, dim)
-                    ctx,     # (n_cls, n_ctx, dim)
-                    suffix,  # (n_cls, *, dim)
-                ],
-                dim=1,
-            )
-
-        elif self.class_token_position == "middle":
-            half_n_ctx = self.n_ctx // 2
-            prompts = []
-            for i in range(self.n_cls):
-                name_len = self.name_lens[i]
-                prefix_i = prefix[i : i + 1, :, :]
-                class_i = suffix[i : i + 1, :name_len, :]
-                suffix_i = suffix[i : i + 1, name_len:, :]
-                ctx_i_half1 = ctx[i : i + 1, :half_n_ctx, :]
-                ctx_i_half2 = ctx[i : i + 1, half_n_ctx:, :]
-                prompt = torch.cat(
-                    [
-                        prefix_i,     # (1, 1, dim)
-                        ctx_i_half1,  # (1, n_ctx//2, dim)
-                        class_i,      # (1, name_len, dim)
-                        ctx_i_half2,  # (1, n_ctx//2, dim)
-                        suffix_i,     # (1, *, dim)
-                    ],
-                    dim=1,
-                )
-                prompts.append(prompt)
-            prompts = torch.cat(prompts, dim=0)
-
-        elif self.class_token_position == "front":
-            prompts = []
-            for i in range(self.n_cls):
-                name_len = self.name_lens[i]
-                prefix_i = prefix[i : i + 1, :, :]
-                class_i = suffix[i : i + 1, :name_len, :]
-                suffix_i = suffix[i : i + 1, name_len:, :]
-                ctx_i = ctx[i : i + 1, :, :]
-                prompt = torch.cat(
-                    [
-                        prefix_i,  # (1, 1, dim)
-                        class_i,   # (1, name_len, dim)
-                        ctx_i,     # (1, n_ctx, dim)
-                        suffix_i,  # (1, *, dim)
-                    ],
-                    dim=1,
-                )
-                prompts.append(prompt)
-            prompts = torch.cat(prompts, dim=0)
-
-        else:
-            raise ValueError
+        prompts = torch.cat(
+            [
+                prefix,  # (n_cls, 1, dim)
+                ctx,     # (n_cls, n_ctx, dim)
+                suffix,  # (n_cls, *, dim)
+            ],
+            dim=1,
+        )
 
         return prompts
 
@@ -200,25 +162,40 @@ class CustomCLIP(nn.Module):
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
-        self.logit_scale = clip_model.logit_scale
+        
+        self.n_cls = self.prompt_learner.n_cls
+        self.vis_dim =self.prompt_learner.vis_dim
         self.dtype = clip_model.dtype
+        self.criterion_conprox = Con_Proximity(num_classes=self.n_cls, 
+                                               feat_dim=self.vis_dim,
+                                               dtype=self.dtype,
+                                               use_gpu=torch.cuda.is_available())
+
+        self.criterion_prox = Proximity(num_classes=self.n_cls, 
+                                        feat_dim=self.vis_dim,
+                                        dtype=self.dtype,
+                                        use_gpu=torch.cuda.is_available())
+
+        self.logit_scale = clip_model.logit_scale
+        self.cfg = cfg
 
     def forward(self, image):
-        image_features = self.image_encoder(image.type(self.dtype))
-
         prompts = self.prompt_learner()
         tokenized_prompts = self.tokenized_prompts
+
+        image_features = self.image_encoder(image.type(self.dtype))
         text_features = self.text_encoder(prompts, tokenized_prompts)
+
+        image_features_norm = image_features.norm(dim=-1, keepdim=True)
+        text_features_norm = text_features.norm(dim=-1, keepdim=True)
 
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-        #logit_scale = self.logit_scale.exp()
-        #logits = logit_scale * image_features @ text_features.t()
-
+        if self.prompt_learner.training:
+            return image_features, text_features, image_features_norm, text_features_norm
         return image_features, text_features
-
-
+        
 @TRAINER_REGISTRY.register()
 class DoCoOp(TrainerX):
 
@@ -229,7 +206,7 @@ class DoCoOp(TrainerX):
             self.device = torch.device("cuda")
         else:
             self.device = torch.device("cpu")
-
+       
         # Save as attributes some frequently used variables
         self.start_epoch = self.epoch = 0
         self.max_epoch = cfg.OPTIM.MAX_EPOCH
@@ -237,22 +214,11 @@ class DoCoOp(TrainerX):
 
         self.cfg = cfg
         self.build_data_loader()
-        #pdb.set_trace()
-        # Copy dataloader_x for data transform
-        self.train_loader_c = copy.deepcopy(self.train_loader_x)
-        transform_tune = get_tuning_transform()
-        self.train_loader_c.transform = transform_tune
         
-        # KMedoids
-        self.km = KMedoids(n_clusters=1, metric="euclidean")
-        
-        # MMD
-        self.mmd = MMD_loss()
-
         # LinearRegression
         lr = LinearRegression()
-        points = np.array([[1, self.cfg.TRAINER.DOCOOP.LAMBDA_OT],
-                           [16, 0.01]])
+        points = np.array([[1, self.cfg.TRAINER.DOCOOP.LAMBDA_PROX],
+                           [16, 1e-5]])
         X = points[:, 0].reshape(-1, 1)
         Y = points[:, 1]
         self.lr = lr.fit(X, Y)
@@ -270,7 +236,7 @@ class DoCoOp(TrainerX):
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
-        
+
         if cfg.TRAINER.DOCOOP.PREC == "fp32" or cfg.TRAINER.DOCOOP.PREC == "amp":
             # CLIP's default precision is fp16
             clip_model.float()
@@ -280,17 +246,43 @@ class DoCoOp(TrainerX):
 
         print("Turning off gradients in both the image and the text encoder")
         for name, param in self.model.named_parameters():
-            if "prompt_learner" not in name:
-                param.requires_grad_(False)
-
+            param.requires_grad_(False)
+        for name, param in self.model.named_parameters():
+            if "prompt_learner" in name or "criterion" in name:
+                param.requires_grad_(True)
+            
+        # Double check
+        enabled = set()
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                enabled.add(name)
+        print(f"Parameters to be updated: {enabled}")
         if cfg.MODEL.INIT_WEIGHTS:
             load_pretrained_weights(self.model.prompt_learner, cfg.MODEL.INIT_WEIGHTS)
         
         self.model.to(self.device)
+        
+        # Setup PC Loss
+        ## set config file
+        from yacs.config import CfgNode as CN
+        optim_copy = cfg.OPTIM.copy()
+        optim_copy["LR"] = self.cfg.TRAINER.DOCOOP.LR_CONPROX
+        CFG_CONPROX = CN(init_dict=optim_copy)
+        optim_copy["LR"] = self.cfg.TRAINER.DOCOOP.LR_PROX
+        CFG_PROX = CN(init_dict=optim_copy)
+
+        self.optim_conprox = build_optimizer(self.model.criterion_conprox.parameters(), CFG_CONPROX)
+        self.optim_prox = build_optimizer(self.model.criterion_prox.parameters(), CFG_PROX)
+        self.sched_conprox = build_lr_scheduler(self.optim_conprox, CFG_CONPROX)
+        self.sched_prox = build_lr_scheduler(self.optim_prox, CFG_PROX)
+        
         # NOTE: only give prompt_learner to the optimizer
         self.optim = build_optimizer(self.model.prompt_learner, cfg.OPTIM)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
+        
         self.register_model("prompt_learner", self.model.prompt_learner, self.optim, self.sched)
+        self.register_model("conprox", self.model.criterion_conprox, self.optim_conprox, self.sched_conprox)
+        self.register_model("prox", self.model.criterion_prox, self.optim_prox, self.sched_prox)
 
         self.scaler = GradScaler() if cfg.TRAINER.DOCOOP.PREC == "amp" else None
 
@@ -317,169 +309,103 @@ class DoCoOp(TrainerX):
         return im_loss
 
     def compute_transport_loss(self, logits, sim_t):
-        s_dist = F.softmax(logits, dim=1)
-        t_dist = F.softmax(logits, dim=0)
+        s_dist = F.softmax(logits, dim=1) # across class
+        t_dist = F.softmax(logits, dim=0) # across data
         cost = 1 - sim_t
         s_cost = (cost * s_dist).sum(1).mean()
         t_cost = (cost * t_dist).sum(0).mean()
-        return s_cost + t_cost
-
-    def run_epoch(self):
-        self.set_model_mode("train")
-        losses = MetricMeter()
-        batch_time = AverageMeter()
-        data_time = AverageMeter()
-        self.num_batches = len(self.train_loader_x)
-
-        end = time.time()
-        for self.batch_idx, batch in enumerate(zip(self.train_loader_x, self.train_loader_c)):
-            data_time.update(time.time() - end)
-            loss_summary = self.forward_backward(batch)
-            batch_time.update(time.time() - end)
-            losses.update(loss_summary)
-
-            meet_freq = (self.batch_idx + 1) % self.cfg.TRAIN.PRINT_FREQ == 0
-            only_few_batches = self.num_batches < self.cfg.TRAIN.PRINT_FREQ
-            if meet_freq or only_few_batches:
-                nb_remain = 0
-                nb_remain += self.num_batches - self.batch_idx - 1
-                nb_remain += (
-                    self.max_epoch - self.epoch - 1
-                ) * self.num_batches
-                eta_seconds = batch_time.avg * nb_remain
-                eta = str(datetime.timedelta(seconds=int(eta_seconds)))
-
-                info = []
-                info += [f"epoch [{self.epoch + 1}/{self.max_epoch}]"]
-                info += [f"batch [{self.batch_idx + 1}/{self.num_batches}]"]
-                info += [f"time {batch_time.val:.3f} ({batch_time.avg:.3f})"]
-                info += [f"data {data_time.val:.3f} ({data_time.avg:.3f})"]
-                info += [f"{losses}"]
-                info += [f"lr {self.get_current_lr():.4e}"]
-                info += [f"eta {eta}"]
-                print(" ".join(info))
-
-            n_iter = self.epoch * self.num_batches + self.batch_idx
-            for name, meter in losses.meters.items():
-                self.write_scalar("train/" + name, meter.avg, n_iter)
-            self.write_scalar("train/lr", self.get_current_lr(), n_iter)
-
-            end = time.time()
-
+        #return s_cost + t_cost
+        return t_cost
 
     def forward_backward(self, batch):
         
-        images_n, labels_n, images_c, _ = self.parse_batch_train(batch)
+        images, labels = self.parse_batch_train(batch)
         
-        prec = self.cfg.TRAINER.DOCOOP.PREC
-        if prec == "amp":
-            with autocast():
-                image_features_n, text_features_n = self.model(images_n)
-                print("autocast")
-                # Cross-Entropy Loss
-                logit_scale = self.model.logit_scale.exp()
-                logits = image_features_n @ text_features_n.t()
-                logits_scaled = logit_scale * logits
-                cross_entropy_loss = F.cross_entropy(logits_scaled, labels_n)
-                
-                # Distribution Loss
-                image_features_c, _ = self.model(images_c)
-                logits_c = image_features_c @ text_features_c.t()
-                logits_scaled_c = logit_scale * logits_c
-            
-                transfer_loss = self.compute_transport_loss(logits_scaled_c, logits_c)
-                mi_loss = self.compute_im_loss(logits_scaled_c)
-                
-                loss = cross_entropy_loss + self.cfg.TRAINER.DOCOOP.LAMBDA_OT * transfer_loss + self.cfg.TRAINER.DOCOOP.LAMBDA_MI * mi_loss
+        image_features_scaled, text_features_scaled, image_norm, txt_norm = self.model(images)
+        image_features = image_features_scaled * image_norm
+        text_features = copy.deepcopy(text_features_scaled.detach())
+        
+        # Cross-Entropy Loss
+        logit_scale = self.model.logit_scale.exp()
+        logits = image_features_scaled @ text_features_scaled.t()
+        logits_scaled = logit_scale * logits
+        
+        cross_entropy_loss = F.cross_entropy(logits_scaled, labels)
 
+        # # Distribution Loss
+        # distribution_loss_list = []
+        # ot_losses = [self.compute_transport_loss(k.unsqueeze(0), v.unsqueeze(0)) for k, v in zip(logits_scaled, logits)]
+        # mi_losses = [self.compute_im_loss(k.unsqueeze(0)) for k in logits_scaled]
+        
+        # if self.cfg.TRAINER.DOCOOP.ADJUST_WEIGHT:
+        #     distribution_loss_list = list(map(lambda v: self.ot_weight * v[0] + 
+        #                                 0.1 * self.ot_weight * v[1], zip(ot_losses, mi_losses)))
+        # else:
+        #     distribution_loss_list = list(map(lambda v: self.cfg.TRAINER.DOCOOP.LAMBDA_OT * v[0] + 
+        #                                 self.cfg.TRAINER.DOCOOP.LAMBDA_MI * v[1], zip(ot_losses, mi_losses)))
+
+        # distribution_loss = max(distribution_loss_list)
+
+        # Prox Loss
+        text_labels = torch.arange(self.dm.num_classes).to(self.device)
+        prox_loss = self.model.criterion_prox(torch.cat((image_features, text_features)), 
+                                        torch.cat((labels, text_labels)))
+        prox_loss *= self.cfg.TRAINER.DOCOOP.LAMBDA_PROX
+        
+        # ConProx Loss
+        conprox_loss = self.model.criterion_conprox(torch.cat((image_features, text_features)), 
+                                        torch.cat((labels, text_labels)))
+        conprox_loss *= self.cfg.TRAINER.DOCOOP.LAMBDA_CONPROX
+        
+        if self.epoch >= 1000:
+            loss = cross_entropy_loss   
             self.optim.zero_grad()
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optim)
-            self.scaler.update()
+            loss.backward()
+            self.optim.step()
+
+            if (self.batch_idx + 1) == self.num_batches:
+                self.sched.step()
+
         else:
-            image_features_n, text_features_n = self.model(images_n)
+            loss = cross_entropy_loss + prox_loss - conprox_loss
             
-            # Cross-Entropy Loss
-            logit_scale = self.model.logit_scale.exp()
-            logits = image_features_n @ text_features_n.t()
-            logits_scaled = logit_scale * logits
-            cross_entropy_loss = F.cross_entropy(logits_scaled, labels_n)
-            
-            # Distribution Loss
-            image_features_c, text_features_c = self.model(images_c)
-            logits_c = image_features_c @ text_features_c.t()
-            logits_scaled_c = logit_scale * logits_c
-        
-            ot_loss = self.compute_transport_loss(logits_scaled_c, logits_c)
-            mi_loss = self.compute_im_loss(logits_scaled_c)
-            
-            # distribution_loss = self.cfg.TRAINER.DOCOOP.LAMBDA_OT * ot_loss + self.cfg.TRAINER.DOCOOP.LAMBDA_MI * mi_loss
-            # images_c = images_c[0]
-            # images_c = torch.unsqueeze(images_c, dim=0)
-            distribution_loss_list = []
-            for image_c in images_c:
-                image_c = torch.unsqueeze(image_c, dim=0)
-                image_features_c, text_features_c = self.model(image_c)
-                logits_c = image_features_c @ text_features_c.t()
-                logits_scaled_c = logit_scale * logits_c
-            
-                ot_loss = self.compute_transport_loss(logits_scaled_c, logits_c)
-                mi_loss = self.compute_im_loss(logits_scaled_c)
-                
-                if self.cfg.TRAINER.DOCOOP.ADJUST_WEIGHT:
-                    # calculate weight from num_shots
-                    distribution_loss_list.append(self.ot_weight * ot_loss + 0.1 * self.ot_weight * mi_loss)
-                else:
-                    distribution_loss_list.append(self.cfg.TRAINER.DOCOOP.LAMBDA_OT * ot_loss + self.cfg.TRAINER.DOCOOP.LAMBDA_MI * mi_loss)
-                    
-            
-            distribution_loss = max(distribution_loss_list)
-            
-            # image_features_c, text_features_c = self.model(images_c)
-            
-            # image_features_c = np.array([d.cpu().numpy() for d in image_features_c])
-            # text_features_c = text_features_c.mean(axis=0, keepdim=True)
-            # text_features_c = np.array([d.cpu().detach().numpy() for d in text_features_c])
-            
-            # image_features_km = self.km.fit(image_features_c).cluster_centers_
-            # text_features_km = self.km.fit(text_features_c).cluster_centers_
-            
-            # image_features_km = torch.tensor(image_features_km, dtype=self.model.dtype, requires_grad=True).to(self.device)            
-            #text_features_km = torch.tensor(text_features_km, dtype=self.model.dtype, requires_grad=False).to(self.device)            
-            
-            # logits_c = image_features_km @ text_features_c.t()
-            # logits_scaled_c = logit_scale * logits_c
-        
-            # ot_loss = self.compute_transport_loss(logits_scaled_c, logits_c)
-            #mi_loss = self.compute_im_loss(logits_scaled_c)
-            # distribution_loss = self.cfg.TRAINER.DOCOOP.LAMBDA_OT * ot_loss + self.cfg.TRAINER.DOCOOP.LAMBDA_MI * mi_loss
-            
-            # distribution_loss = self.cfg.TRAINER.DOCOOP.LAMBDA_OT * self.mmd(image_features_km, text_features_c)
-            loss = cross_entropy_loss + distribution_loss         
-            
-            self.model_backward_and_update(loss)
+            self.optim.zero_grad()
+            self.optim_conprox.zero_grad()
+            self.optim_prox.zero_grad()
 
+            loss.backward()
+            self.optim.step()
+
+            for param in self.model.criterion_conprox.parameters():
+                param.grad.data *= (1. / self.cfg.TRAINER.DOCOOP.LAMBDA_CONPROX)
+
+            for param in self.model.criterion_prox.parameters():
+                param.grad.data *= (1. / self.cfg.TRAINER.DOCOOP.LAMBDA_PROX)
+
+            self.optim_conprox.step()
+            self.optim_prox.step()
+
+            if (self.batch_idx + 1) == self.num_batches:
+                self.sched.step()
+                self.sched_prox.step()
+                self.sched_conprox.step()
+ 
         loss_summary = {
-            "loss": loss.item(),
-            "acc": compute_accuracy(logits, labels_n)[0].item(),
+            "loss(ce)": cross_entropy_loss.item(),
+            #"loss(d)" : distribution_loss.item(),
+            "loss(prox)": prox_loss.item(),
+            "loss(conprox)": conprox_loss.item(),
+            "acc": compute_accuracy(logits, labels)[0].item(),
         }
-
-        if (self.batch_idx + 1) == self.num_batches:
-            self.update_lr()
 
         return loss_summary
 
     def parse_batch_train(self, batch):
-        batch_n, batch_c = batch
-        input_n = batch_n["img"]
-        label_n = batch_n["label"]
-        input_c = batch_c["img"]
-        label_c = batch_c["label"]
-        input_n = input_n.to(self.device)
-        label_n = label_n.to(self.device)
-        input_c = input_c.to(self.device)
-        label_c = label_c.to(self.device)
-        return input_n, label_n, input_c, label_c
+        input = batch["img"]
+        label = batch["label"]
+        input = input.to(self.device)
+        label = label.to(self.device)
+        return input, label
 
     def load_model(self, directory, epoch=None):
         if not directory:
@@ -546,3 +472,69 @@ class DoCoOp(TrainerX):
             self.write_scalar(tag, v, self.epoch)
 
         return list(results.values())[0]
+
+
+    def embedding_feature(self, VISUAL_MAX_NUM=2000):
+        umap = TSNE()
+        # extract feature from visual encoder
+        image_features = []
+        text_features = []
+        image_labels = []
+        self.set_model_mode("eval")
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(self.test_loader):
+                
+                images, labels = self.parse_batch_train(batch)
+                
+                image_feature, text_feature = self.model_inference(images) # clip visual encoder
+                image_features.append(image_feature)
+                text_features.append(text_feature)
+                image_labels.append(labels)
+        
+        image_features = torch.cat(image_features)
+        image_labels = torch.cat(image_labels)
+        text_features = text_features[0][:len(self.dm.dataset.classnames)]
+        
+        if len(image_features) > VISUAL_MAX_NUM:
+            sample_idx = torch.randint(0, len(image_features), (VISUAL_MAX_NUM, ))
+            image_features = image_features[sample_idx]
+            image_labels = image_labels[sample_idx]
+     
+        def scaling(data):
+            min_val = data.min(0, keepdim=True)[0]
+            max_val = data.max(0, keepdim=True)[0]
+            return (data - min_val) / (max_val - min_val)
+        
+         
+        features = torch.cat((scaling(image_features), scaling(text_features)))
+        embeddings = umap.fit_transform(features.cpu())
+        
+        # calc distance
+        d_img_txt = []
+        d_txt_txt = []
+        for label in range(self.dm.num_classes):
+            img_src = image_features[image_labels==label]
+            txt_src = text_features[label].unsqueeze(0)
+            
+            d_img_txt.append(torch.norm(img_src-txt_src, dim=1).mean().item())
+            d_txt_txt.append(torch.norm(text_features-txt_src, dim=1).mean().item())
+        
+        print(f"dist(img vs txt): {np.mean(d_img_txt)}±{np.std(d_img_txt)}")
+        print(f"dist(txt vs txt): {np.mean(d_txt_txt)}±{np.std(d_txt_txt)}")
+        
+        # visualize
+        num_class = len(self.dm.dataset.classnames)
+        classnames = self.dm.dataset.classnames
+        
+        image_embeddings = embeddings[:-num_class]
+        text_embeddings = embeddings[len(image_embeddings):]
+        
+        plt.figure(figsize=(8, 8))
+        cmap = plt.cm.get_cmap("tab10", num_class)
+        for i in range(num_class):
+            indices = (image_labels.cpu() == i).numpy()
+            plt.scatter(image_embeddings[indices, 0], image_embeddings[indices, 1], s=10, alpha=1.0, c=[cmap(i)])
+        for i in range(num_class):       
+            plt.scatter(text_embeddings[i, 0], text_embeddings[i, 1], label=str(i), s=200, marker="*", alpha=1.0, c=[cmap(i)], edgecolors="black")
+        plt.legend()
+        plt.savefig(f'./output/plots/tsne_DoCoOp_{self.cfg.DATASET.NAME}_{self.cfg.DATASET.NUM_SHOTS}_{self.cfg.OPTIM.MAX_EPOCH}.png', bbox_inches="tight")

@@ -29,8 +29,12 @@ import datasets.chestxray
 import trainers.coop
 import trainers.cocoop
 import trainers.docoop
+import trainers.docoop2
 import trainers.dococoop
 import trainers.zsclip
+
+import random
+import numpy as np
 
 
 def print_args(args, cfg):
@@ -98,7 +102,8 @@ def extend_cfg(cfg):
     cfg.TRAINER.COOP.CTX_INIT = ""  # initialization words
     cfg.TRAINER.COOP.PREC = "fp16"  # fp16, fp32, amp
     cfg.TRAINER.COOP.CLASS_TOKEN_POSITION = "end"  # 'middle' or 'end' or 'front'
-
+    cfg.TRAINER.COOP.MIX_GEN = False
+    
     cfg.TRAINER.COCOOP = CN()
     cfg.TRAINER.COCOOP.N_CTX = 16  # number of context vectors
     cfg.TRAINER.COCOOP.CTX_INIT = ""  # initialization words
@@ -113,17 +118,40 @@ def extend_cfg(cfg):
     cfg.TRAINER.DOCOOP.CSC = False  # class-specific context
     cfg.TRAINER.DOCOOP.CLASS_TOKEN_POSITION = "end"  # 'middle' or 'end' or 'front'
     cfg.TRAINER.DOCOOP.ADJUST_WEIGHT = False
+    cfg.TRAINER.DOCOOP.LAMBDA_PROX = 0.000001
+    cfg.TRAINER.DOCOOP.LAMBDA_CONPROX = 0.000001
+    cfg.TRAINER.DOCOOP.MIX_GEN = False
+    cfg.TRAINER.DOCOOP.LR_PROX = 0.001
+    cfg.TRAINER.DOCOOP.LR_CONPROX = 0.0001
+    
+    cfg.TRAINER.DOCOOP2 = CN()
+    cfg.TRAINER.DOCOOP2.N_CTX = 3  # number of context vectors
+    cfg.TRAINER.DOCOOP2.N_DMX = 3  # number of context vectors
+    cfg.TRAINER.DOCOOP2.CTX_INIT = ""  # initialization words
+    cfg.TRAINER.DOCOOP2.PREC = "fp16"  # fp16, fp32, amp
+    cfg.TRAINER.DOCOOP2.LAMBDA_OT = 4.0
+    cfg.TRAINER.DOCOOP2.LAMBDA_MI = 0.4
+    cfg.TRAINER.DOCOOP2.CSC = False  # class-specific context
+    cfg.TRAINER.DOCOOP2.CLASS_TOKEN_POSITION = "end"  # 'middle' or 'end' or 'front'
+    cfg.TRAINER.DOCOOP2.ADJUST_WEIGHT = False
     
     cfg.TRAINER.DOCOCOOP = CN()
-    cfg.TRAINER.DOCOCOOP.N_CTX = 3  # number of context vectors
+    cfg.TRAINER.DOCOCOOP.N_CTX = 16  # number of context vectors
     cfg.TRAINER.DOCOCOOP.CTX_INIT = ""  # initialization words
     cfg.TRAINER.DOCOCOOP.PREC = "fp16"  # fp16, fp32, amp
     cfg.TRAINER.DOCOCOOP.LAMBDA_OT = 4.0
     cfg.TRAINER.DOCOCOOP.LAMBDA_MI = 0.4
     cfg.TRAINER.DOCOCOOP.CSC = False  # class-specific context
     cfg.TRAINER.DOCOCOOP.CLASS_TOKEN_POSITION = "end"  # 'middle' or 'end' or 'front'
-
+    cfg.TRAINER.DOCOCOOP.ADJUST_WEIGHT = False
+    cfg.TRAINER.DOCOCOOP.LAMBDA_PROX = 0.000001
+    cfg.TRAINER.DOCOCOOP.LAMBDA_CONPROX = 0.000001
+    cfg.TRAINER.DOCOCOOP.LR_PROX = 0.001
+    cfg.TRAINER.DOCOCOOP.LR_CONPROX = 0.0001   
+    
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
+    cfg.DATASET.NUM_CLASS = 10
+
 
 def setup_cfg(args):
     cfg = get_cfg_default()
@@ -142,7 +170,7 @@ def setup_cfg(args):
     # 4. From optional input arguments
     cfg.merge_from_list(args.opts)
 
-    cfg.freeze()
+    cfg.freeze()    
 
     return cfg
 
@@ -160,13 +188,19 @@ def main(args):
     print_args(args, cfg)
     print("Collecting env info ...")
     print("** System info **\n{}\n".format(collect_env_info()))
-
     trainer = build_trainer(cfg)
+    if args.embedding_feature:
+        trainer.load_model(args.model_dir, epoch=args.load_epoch)
+        trainer.embedding_feature()
+        return
     if args.eval_only:
         trainer.load_model(args.model_dir, epoch=args.load_epoch)
         trainer.test()
         return
-
+    if args.eval_only and cfg.TEST.FINAL_MODEL == "best_val":
+        trainer.load_model(args.model_dir)
+        trainer.test()
+        return
     if not args.no_train:
         trainer.train()
 
@@ -206,6 +240,7 @@ if __name__ == "__main__":
     parser.add_argument("--backbone", type=str, default="", help="name of CNN backbone")
     parser.add_argument("--head", type=str, default="", help="name of head")
     parser.add_argument("--eval-only", action="store_true", help="evaluation only")
+    parser.add_argument("--embedding_feature", action="store_true", help="embedding feature using tsne")
     parser.add_argument(
         "--model-dir",
         type=str,

@@ -18,7 +18,7 @@ class OxfordPets(DatasetBase):
         self.dataset_dir = os.path.join(root, self.dataset_dir)
         self.image_dir = os.path.join(self.dataset_dir, "images")
         self.anno_dir = os.path.join(self.dataset_dir, "annotations")
-        self.split_path = os.path.join(self.dataset_dir, "split_OxfordPets.json")
+        self.split_path = os.path.join(self.dataset_dir, "split_zhou_OxfordPets.json")
         self.split_fewshot_dir = os.path.join(self.dataset_dir, "split_fewshot")
                 
         mkdir_if_missing(self.split_fewshot_dir)

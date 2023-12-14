@@ -13,6 +13,12 @@ from dassl.optim import build_optimizer, build_lr_scheduler
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 
+import umap
+from mixgen import mixgen_pt, mixgen_batch
+from sklearn.manifold import TSNE
+from scipy.sparse.csgraph import connected_components
+import matplotlib.pyplot as plt
+
 _tokenizer = _Tokenizer()
 
 
@@ -49,11 +55,9 @@ class TextEncoder(nn.Module):
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
-
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
-
         return x
 
 
@@ -191,21 +195,34 @@ class CustomCLIP(nn.Module):
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
+        self.cfg = cfg
+        
+    def forward(self, image, label=None, embedding=False):
+        if embedding:
+            image_feature = self.image_encoder(image.type(self.dtype)) # clip visual encoder    
+            prompts = self.prompt_learner()
+            tokenized_prompts = self.tokenized_prompts
+            text_feature = self.text_encoder(prompts, tokenized_prompts)
+            return image_feature, text_feature
+        
+        else:
+            prompts = self.prompt_learner()
+            tokenized_prompts = self.tokenized_prompts
+            
+            image_features = self.image_encoder(image.type(self.dtype))
+            text_features = self.text_encoder(prompts, tokenized_prompts)
 
-    def forward(self, image):
-        image_features = self.image_encoder(image.type(self.dtype))
-        prompts = self.prompt_learner()
-        tokenized_prompts = self.tokenized_prompts
-        text_features = self.text_encoder(prompts, tokenized_prompts)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            logit_scale = self.logit_scale.exp()
+            logits = logit_scale * image_features @ text_features.t()
 
-        logit_scale = self.logit_scale.exp()
-        logits = logit_scale * image_features @ text_features.t()
-
-        return logits
-
+            if label is None:
+                return logits
+            else:
+                return logits, label
+    
 
 @TRAINER_REGISTRY.register()
 class CoOp(TrainerX):
@@ -268,10 +285,10 @@ class CoOp(TrainerX):
             self.scaler.step(self.optim)
             self.scaler.update()
         else:
-            output = self.model(image)
-            loss = F.cross_entropy(output, label)
+            output, labels = self.model(image, label)
+            loss = F.cross_entropy(output, labels)
             self.model_backward_and_update(loss)
-
+                
         loss_summary = {
             "loss": loss.item(),
             "acc": compute_accuracy(output, label)[0].item(),
@@ -322,3 +339,60 @@ class CoOp(TrainerX):
             print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
             # set strict=False
             self._models[name].load_state_dict(state_dict, strict=False)
+    
+    def embedding_feature(self, VISUAL_MAX_NUM=2000):
+        tsne = TSNE()
+        tsne = umap.UMAP(random_state=42)
+        # extract feature from visual encoder
+        image_features = []
+        text_features = []
+        image_labels = []
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(self.test_loader):
+                
+                images, labels = self.parse_batch_train(batch)
+                
+                image_feature, text_feature = self.model(images, embedding=True) # clip visual encoder
+                
+                image_features.append(image_feature)
+                text_features.append(text_feature)
+                image_labels.append(labels)
+        
+        image_features = torch.cat(image_features)
+        image_labels = torch.cat(image_labels)
+        text_features = text_features[0][:len(self.dm.dataset.classnames)]
+                
+        if len(image_features) > VISUAL_MAX_NUM:
+            sample_idx = torch.randint(0, len(image_features), (VISUAL_MAX_NUM, ))
+            image_features = image_features[sample_idx]
+            image_labels = image_labels[sample_idx]
+
+        def scaling(data):
+            min_val = data.min(0, keepdim=True)[0]
+            max_val = data.max(0, keepdim=True)[0]
+            return (data - min_val) / (max_val - min_val)
+        
+        features = torch.cat((scaling(image_features), scaling(text_features)))
+        embeddings = tsne.fit_transform(features.cpu())
+        
+        # visualize
+        num_class = len(self.dm.dataset.classnames)
+        classnames = self.dm.dataset.classnames
+        
+        image_embeddings = embeddings[:-num_class]
+        text_embeddings = embeddings[len(image_embeddings):]
+
+        plt.figure(figsize=(8,8))
+        cmap = plt.cm.get_cmap("tab10", num_class)
+        for i in range(num_class):
+            indices = (image_labels.cpu() == i).numpy()
+            plt.scatter(image_embeddings[indices, 0], image_embeddings[indices, 1], s=10, alpha=1.0, c=[cmap(i)])
+        for i in range(num_class): 
+            if i < num_class/2:
+                plt.scatter(text_embeddings[i, 0], text_embeddings[i, 1], label=str(i), s=200, marker="*", alpha=0.5, c=[cmap(i)], edgecolors="black")
+            else:
+                plt.scatter(text_embeddings[i, 0], text_embeddings[i, 1], label=str(i), s=200, marker="p", alpha=0.5, c=[cmap(i)], edgecolors="black")
+
+        plt.legend()
+        plt.savefig(f'./output/plots/tsne_CoOp_{self.cfg.DATASET.NAME}_{self.cfg.DATASET.NUM_SHOTS}_{self.cfg.OPTIM.MAX_EPOCH}.png', bbox_inches="tight")
+

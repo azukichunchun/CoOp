@@ -1,7 +1,7 @@
 import os.path as osp
 from collections import OrderedDict
 import math
-
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -17,6 +17,9 @@ from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 
 _tokenizer = _Tokenizer()
 
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+import umap
 
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
@@ -171,28 +174,43 @@ class CustomCLIP(nn.Module):
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
-    def forward(self, image, label=None):
+    def forward(self, image, label=None, embedding=False):
+        
         tokenized_prompts = self.tokenized_prompts
         logit_scale = self.logit_scale.exp()
 
-        image_features = self.image_encoder(image.type(self.dtype))
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        if embedding:
+            image_features = self.image_encoder(image.type(self.dtype))
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
-        prompts = self.prompt_learner(image_features)
+            prompts = self.prompt_learner(image_features)
         
-        logits = []
-        for pts_i, imf_i in zip(prompts, image_features):
-            text_features = self.text_encoder(pts_i, tokenized_prompts)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-            l_i = logit_scale * imf_i @ text_features.t()
-            logits.append(l_i)
-        logits = torch.stack(logits)
+            text_features_ = []
+            for pts_i, imf_i in zip(prompts, image_features):
+                text_features = self.text_encoder(pts_i, tokenized_prompts)
+                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+                text_features_.append(text_features)
+            text_features = torch.stack(text_features_)
+            return image_features, text_features
         
-        if self.prompt_learner.training:
-            print("aaaaaaa")
-            return F.cross_entropy(logits, label)
-        
-        return logits
+        else:
+            image_features = self.image_encoder(image.type(self.dtype))
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+            prompts = self.prompt_learner(image_features)
+            
+            logits = []
+            for pts_i, imf_i in zip(prompts, image_features):
+                text_features = self.text_encoder(pts_i, tokenized_prompts)
+                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+                l_i = logit_scale * imf_i @ text_features.t()
+                logits.append(l_i)
+            logits = torch.stack(logits)
+            
+            if self.prompt_learner.training:
+                return F.cross_entropy(logits, label)
+            
+            return logits
 
 
 @TRAINER_REGISTRY.register()
@@ -314,3 +332,72 @@ class CoCoOp(TrainerX):
             print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
             # set strict=False
             self._models[name].load_state_dict(state_dict, strict=False)
+
+    def embedding_feature(self, VISUAL_MAX_NUM=2000, TEXT_MAX_NUM=20):
+        #tsne = TSNE(perplexity=50, n_iter=1000)
+        tsne = umap.UMAP(random_state=42)
+        
+        # extract feature from visual encoder
+        image_features = []
+        text_features = []
+        image_labels = []
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(self.test_loader):
+                
+                images, labels = self.parse_batch_train(batch)
+                
+                image_feature, text_feature = self.model(images, embedding=True) # clip visual encoder
+                
+                image_features.append(image_feature)
+                text_features.append(text_feature)
+                image_labels.append(labels)
+        
+        image_features = torch.cat(image_features)
+        image_labels = torch.cat(image_labels)
+        #text_features = text_features[0][:len(self.dm.dataset.classnames)]
+        text_features = torch.cat(text_features)
+        text_features = text_features.reshape(-1, self.dm.num_classes, 512)
+        text_features = text_features[2]
+        
+        if len(image_features) > VISUAL_MAX_NUM:
+            sample_idx = torch.randint(0, len(image_features), (VISUAL_MAX_NUM, ))
+            image_features = image_features[sample_idx]
+            image_labels = image_labels[sample_idx]
+
+        # if len(text_features) > TEXT_MAX_NUM:
+        #     sample_idx = torch.randint(0, len(text_features), (TEXT_MAX_NUM, ))
+        #     text_features = text_features[sample_idx]           
+
+        def scaling(data):
+            min_val = data.min(0, keepdim=True)[0]
+            max_val = data.max(0, keepdim=True)[0]
+            return (data - min_val) / (max_val - min_val)
+        
+        #text_features = text_features.reshape(-1, 512)
+        
+        features = torch.cat((scaling(image_features), scaling(text_features)))
+        embeddings = tsne.fit_transform(features.cpu())
+        
+        # visualize
+        num_class = len(self.dm.dataset.classnames)
+        classnames = self.dm.dataset.classnames
+        
+        image_embeddings = embeddings[:len(image_features)]
+        text_embeddings = embeddings[len(image_embeddings):]
+
+        plt.figure(figsize=(8,8))
+        cmap = plt.cm.get_cmap("tab10", num_class)
+        for i in range(num_class):
+            indices = (image_labels.cpu() == i).numpy()
+            plt.scatter(image_embeddings[indices, 0], image_embeddings[indices, 1], s=10, alpha=1.0, c=[cmap(i)])
+        
+        text_chunks = np.array_split(text_embeddings, int(text_embeddings.shape[0]/self.dm.num_classes))
+        for text_chun in text_chunks:
+            for i in range(num_class):
+                if i < num_class/2:
+                    plt.scatter(text_chun[i, 0], text_chun[i, 1], label=str(i), s=200, marker="*", alpha=0.5, c=[cmap(i)], edgecolors="black")
+                else:
+                    plt.scatter(text_chun[i, 0], text_chun[i, 1], label=str(i), s=200, marker="p", alpha=0.5, c=[cmap(i)], edgecolors="black")
+                    
+        plt.legend()
+        plt.savefig(f'./output/plots/tsne_CoCoOp_{self.cfg.DATASET.NAME}_{self.cfg.DATASET.NUM_SHOTS}_{self.cfg.OPTIM.MAX_EPOCH}.png', bbox_inches="tight")

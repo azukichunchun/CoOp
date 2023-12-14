@@ -20,7 +20,7 @@ class ImageNet(DatasetBase):
         self.preprocessed = os.path.join(self.dataset_dir, "preprocessed.pkl")
         self.split_fewshot_dir = os.path.join(self.dataset_dir, "split_fewshot")
         mkdir_if_missing(self.split_fewshot_dir)
-
+    
         if os.path.exists(self.preprocessed):
             with open(self.preprocessed, "rb") as f:
                 preprocessed = pickle.load(f)

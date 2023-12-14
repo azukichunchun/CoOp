@@ -17,7 +17,7 @@ class DescribableTextures(DatasetBase):
         root = os.path.abspath(os.path.expanduser(cfg.DATASET.ROOT))
         self.dataset_dir = os.path.join(root, self.dataset_dir)
         self.image_dir = os.path.join(self.dataset_dir, "images")
-        self.split_path = os.path.join(self.dataset_dir, "split_DescribableTextures.json")
+        self.split_path = os.path.join(self.dataset_dir, "split_zhou_DescribableTextures.json")
         self.split_fewshot_dir = os.path.join(self.dataset_dir, "split_fewshot")
         mkdir_if_missing(self.split_fewshot_dir)
 
