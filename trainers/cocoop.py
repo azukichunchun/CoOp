@@ -3,9 +3,11 @@ from collections import OrderedDict
 import math
 import numpy as np
 import torch
+from itertools import chain
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.cuda.amp import GradScaler, autocast
+import pickle
 
 from dassl.engine import TRAINER_REGISTRY, TrainerX
 from dassl.metrics import compute_accuracy
@@ -20,6 +22,7 @@ _tokenizer = _Tokenizer()
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 import umap
+from etran.metrics import Energy_Score
 
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
@@ -263,6 +266,25 @@ class CoCoOp(TrainerX):
         if device_count > 1:
             print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
             self.model = nn.DataParallel(self.model)
+
+        # Calculate energy using etran
+        energy = []
+        impaths = []
+        for batch_idx, batch in enumerate(self.train_loader_x):
+            images, labels = self.parse_batch_train(batch)
+            features = self.model.image_encoder(images.type(self.model.dtype))
+#            pdb.set_trace()
+            impaths.append(batch['impath'])
+            energy.append(Energy_Score(logits=features.detach().cpu(), percent=0.5, tail="").tolist())
+        impaths = list(chain.from_iterable(impaths))
+        energy = np.array(list(chain.from_iterable(energy)))
+
+        output = {"energy": energy, "impath": impaths}
+        with open(osp.join(self.cfg.OUTPUT_DIR, "etran_and_path.pkl"), "wb") as file:
+            pickle.dump(output, file)
+
+        np.save(osp.join(self.cfg.OUTPUT_DIR, "etran.npy"), energy)
+
 
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)

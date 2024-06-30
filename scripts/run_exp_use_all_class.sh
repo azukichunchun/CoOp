@@ -2,7 +2,7 @@
 
 # custom config
 DATA=data
-
+DATA=/data2/yhiro/data
 TRAINER=$1
 DATASET=$2
 SHOTS=$3

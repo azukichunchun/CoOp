@@ -19,7 +19,7 @@ NEW_CNAMES = {
 @DATASET_REGISTRY.register()
 class Caltech101(DatasetBase):
 
-    dataset_dir = "caltech-101"
+    dataset_dir = "caltech101"
 
     def __init__(self, cfg):
         root = os.path.abspath(os.path.expanduser(cfg.DATASET.ROOT))
@@ -39,19 +39,29 @@ class Caltech101(DatasetBase):
         if num_shots >= 1:
             seed = cfg.SEED
             preprocessed = os.path.join(self.split_fewshot_dir, f"shot_{num_shots}-seed_{seed}.pkl")
-            
-            if os.path.exists(preprocessed):
-                print(f"Loading preprocessed few-shot data from {preprocessed}")
-                with open(preprocessed, "rb") as file:
-                    data = pickle.load(file)
-                    train, val = data["train"], data["val"]
-            else:
-                train = self.generate_fewshot_dataset(train, num_shots=num_shots)
-                val = self.generate_fewshot_dataset(val, num_shots=min(num_shots, 4))
+
+            if cfg.DATALOADER.ENERGY.USE_ENERGY:
+
+                # energyとpathのリストを読み込む
+                with open(os.path.join(self.dataset_dir, 'energy_score_list.pkl'), "rb") as file:
+                    path_to_energy = pickle.load(file)
+
+                train = self.generate_fewshot_dataset_based_on_energy(path_to_energy, train, target=cfg.DATALOADER.ENERGY.USAGE_RANK, num_shot=num_shots)
+                val = self.generate_fewshot_dataset_based_on_energy(path_to_energy, val, target=cfg.DATALOADER.ENERGY.USAGE_RANK, num_shot=min(num_shots, 4))
                 data = {"train": train, "val": val}
-                print(f"Saving preprocessed few-shot data to {preprocessed}")
-                with open(preprocessed, "wb") as file:
-                    pickle.dump(data, file, protocol=pickle.HIGHEST_PROTOCOL)
+            else:
+                if os.path.exists(preprocessed):
+                    print(f"Loading preprocessed few-shot data from {preprocessed}")
+                    with open(preprocessed, "rb") as file:
+                        data = pickle.load(file)
+                        train, val = data["train"], data["val"]
+                else:
+                    train = self.generate_fewshot_dataset(train, num_shots=num_shots)
+                    val = self.generate_fewshot_dataset(val, num_shots=min(num_shots, 4))
+                    data = {"train": train, "val": val}
+                    print(f"Saving preprocessed few-shot data to {preprocessed}")
+                    with open(preprocessed, "wb") as file:
+                        pickle.dump(data, file, protocol=pickle.HIGHEST_PROTOCOL)
 
         subsample = cfg.DATASET.SUBSAMPLE_CLASSES
         train, val, test = OxfordPets.subsample_classes(train, val, test, subsample=subsample)

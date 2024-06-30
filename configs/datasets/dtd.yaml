@@ -1,3 +1,4 @@
 DATASET:
   NAME: "DescribableTextures"
   NUM_CLASS: 47
+  SAMPLE_SEED: 1

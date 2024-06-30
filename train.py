@@ -18,6 +18,9 @@ import datasets.caltech101
 import datasets.ucf101
 import datasets.imagenet
 
+import datasets.oxford_pets_active
+import datasets.eurosat_active
+
 import datasets.imagenet_sketch
 import datasets.imagenetv2
 import datasets.imagenet_a
@@ -32,6 +35,8 @@ import trainers.docoop
 import trainers.docoop2
 import trainers.dococoop
 import trainers.zsclip
+import trainers.etran_score
+import trainers.active
 
 import random
 import numpy as np
@@ -63,6 +68,9 @@ def reset_cfg(cfg, args):
 
     if args.seed:
         cfg.SEED = args.seed
+
+    if args.sample_seed:
+        cfg.DATASET.SAMPLE_SEED = args.sample_seed
 
     if args.source_domains:
         cfg.DATASET.SOURCE_DOMAINS = args.source_domains
@@ -147,11 +155,16 @@ def extend_cfg(cfg):
     cfg.TRAINER.DOCOCOOP.LAMBDA_PROX = 0.000001
     cfg.TRAINER.DOCOCOOP.LAMBDA_CONPROX = 0.000001
     cfg.TRAINER.DOCOCOOP.LR_PROX = 0.001
-    cfg.TRAINER.DOCOCOOP.LR_CONPROX = 0.0001   
+    cfg.TRAINER.DOCOCOOP.LR_CONPROX = 0.0001
+    cfg.TRAINER.DOCOCOOP.PROX_EPOCH = 12
     
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
     cfg.DATASET.NUM_CLASS = 10
+    cfg.DATASET.SAMPLE_SEED = 1
 
+    cfg.DATALOADER.ENERGY = CN()
+    cfg.DATALOADER.ENERGY.USE_ENERGY = False
+    cfg.DATALOADER.ENERGY.USAGE_RANK = "max"
 
 def setup_cfg(args):
     cfg = get_cfg_default()
@@ -180,6 +193,12 @@ def main(args):
     if cfg.SEED >= 0:
         print("Setting fixed seed: {}".format(cfg.SEED))
         set_random_seed(cfg.SEED)
+
+        # check random seed #
+        data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        sample = random.sample(data, 3)
+        print(f"When seed is {cfg.SEED}, choised samples are {sample}")
+
     setup_logger(cfg.OUTPUT_DIR)
 
     if torch.cuda.is_available() and cfg.USE_CUDA:
@@ -217,6 +236,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--seed", type=int, default=-1, help="only positive value enables a fixed seed"
+    )
+    parser.add_argument(
+        "--sample-seed", type=int, default=-1, help="only positive value enables a fixed sample seed"
     )
     parser.add_argument(
         "--source-domains", type=str, nargs="+", help="source domains for DA/DG"

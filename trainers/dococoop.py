@@ -3,6 +3,7 @@ from collections import OrderedDict
 import numpy as np
 import pdb
 from tqdm import tqdm
+from itertools import chain
 import copy
 import torch
 import torch.nn as nn
@@ -22,8 +23,10 @@ from sklearn.linear_model import LinearRegression
 from sklearn.manifold import TSNE
 import umap
 import matplotlib.pyplot as plt
+import pickle
 
 from contrastive import Proximity, Con_Proximity
+from etran.metrics import Energy_Score
 
 _tokenizer = _Tokenizer()
 
@@ -181,6 +184,7 @@ class CustomCLIP(nn.Module):
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
         self.n_cls = self.prompt_learner.n_cls
+
         self.vis_dim =self.prompt_learner.vis_dim
         self.dtype = clip_model.dtype
         
@@ -328,6 +332,34 @@ class DoCoCoOp(TrainerX):
             print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
             self.model = nn.DataParallel(self.model)
 
+        # Calculate energy using etran
+        energy = []
+        energy_logits = []
+        impaths = []
+        for batch_idx, batch in enumerate(self.train_loader_x):
+            images, labels = self.parse_batch_train(batch)
+            features = self.model.image_encoder(images.type(self.model.dtype))
+            imfs, txfs, _, _ = self.model(images.type(self.model.dtype))
+
+            logits = []
+            for imf, txf in zip(imfs, txfs):
+                logits.append(imf @ txf.t())
+            logits = torch.stack(logits)
+            
+            impaths.append(batch['impath'])
+            energy.append(Energy_Score(logits=features.detach().cpu(), percent=0.5, tail="").tolist())
+            energy_logits.append(Energy_Score(logits=logits.detach().cpu(), percent=0.5, tail="").tolist())
+        impaths = list(chain.from_iterable(impaths))
+        energy = np.array(list(chain.from_iterable(energy)))
+        energy_logits = np.array(list(chain.from_iterable(energy_logits)))
+
+        output = {"energy": energy, "energy_logits": energy_logits, "impath": impaths}
+        with open(osp.join(self.cfg.OUTPUT_DIR, "etran_and_path.pkl"), "wb") as file:
+            pickle.dump(output, file)
+
+        np.save(osp.join(self.cfg.OUTPUT_DIR, "etran.npy"), energy)
+            
+            
     def get_entropy(self, input_):
         bs = input_.size(0)
         epsilon = 1e-5
@@ -381,23 +413,17 @@ class DoCoCoOp(TrainerX):
         logits = torch.stack(logits)
         logits_scaled = torch.stack(logits_scaled)
         cross_entropy_loss = F.cross_entropy(logits_scaled, labels)
-        
-        # # Distribution loss
-        # distribution_loss_list = []
-        # ot_losses = [self.compute_transport_loss(k.unsqueeze(0), v.unsqueeze(0)) for k, v in zip(logits_scaled, logits)]
-        # mi_losses = [self.compute_im_loss(k.unsqueeze(0)) for k in logits_scaled]
-        
-        # if self.cfg.TRAINER.DOCOCOOP.ADJUST_WEIGHT:
-        #     distribution_loss_list = list(map(lambda v: self.ot_weight * v[0] + 
-        #                                 0.1 * self.ot_weight * v[1], zip(ot_losses, mi_losses)))
-        # else:
-        #     distribution_loss_list = list(map(lambda v: self.cfg.TRAINER.DOCOCOOP.LAMBDA_OT * v[0] + 
-        #                                 self.cfg.TRAINER.DOCOCOOP.LAMBDA_MI * v[1], zip(ot_losses, mi_losses)))
-    
-        # distribution_loss = max(distribution_loss_list)
 
         # ConProx Loss and Prox Loss
-        text_labels = torch.arange(self.dm.num_classes).to(self.device)
+        #text_labels = torch.arange(self.dm.num_classes).to(self.device)
+        text_labels = []
+        label_info = [d.classname for d in self.dm.dataset.val]
+        for c_t in self.dm.dataset.classnames:
+            for i, c_v in enumerate(label_info):
+                if c_t == c_v:
+                    text_labels.append(i)
+        text_labels = torch.tensor(text_labels).to(self.device)
+
         conprox_loss_list = []
         prox_loss_list = []
         for txf in text_features:
@@ -414,7 +440,8 @@ class DoCoCoOp(TrainerX):
         conprox_loss = min(conprox_loss_list)
         prox_loss = max(prox_loss_list)
         
-        if self.epoch <= 5:        
+        if self.epoch <= self.cfg.TRAINER.DOCOCOOP.PROX_EPOCH:
+        #if self.epoch <= 5:        
             loss = cross_entropy_loss                
             optim.zero_grad()        
             loss.backward()

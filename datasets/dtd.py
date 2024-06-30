@@ -1,9 +1,10 @@
 import os
 import pickle
 import random
+import numpy as np
 
 from dassl.data.datasets import DATASET_REGISTRY, Datum, DatasetBase
-from dassl.utils import listdir_nohidden, mkdir_if_missing
+from dassl.utils import listdir_nohidden, mkdir_if_missing, set_random_seed
 
 from .oxford_pets import OxfordPets
 
@@ -30,26 +31,58 @@ class DescribableTextures(DatasetBase):
         num_shots = cfg.DATASET.NUM_SHOTS
         if num_shots >= 1:
             seed = cfg.SEED
-            preprocessed = os.path.join(self.split_fewshot_dir, f"shot_{num_shots}-seed_{seed}.pkl")
-            
-            if os.path.exists(preprocessed):
-                print(f"Loading preprocessed few-shot data from {preprocessed}")
-                with open(preprocessed, "rb") as file:
-                    data = pickle.load(file)
-                    train, val = data["train"], data["val"]
-            else:
-                train = self.generate_fewshot_dataset(train, num_shots=num_shots)
-                val = self.generate_fewshot_dataset(val, num_shots=min(num_shots, 4))
+            sample_seed = cfg.DATASET.SAMPLE_SEED
+            preprocessed = os.path.join(self.split_fewshot_dir, f"shot_{num_shots}-seed_{seed}-{sample_seed}.pkl")
+
+            if cfg.DATALOADER.ENERGY.USE_ENERGY:
+
+                # energyとpathのリストを読み込む
+                with open(os.path.join(self.dataset_dir, 'energy_score_list.pkl'), "rb") as file:
+                    path_to_energy = pickle.load(file)
+
+                train = self.generate_fewshot_dataset_based_on_energy(path_to_energy, train, target=cfg.DATALOADER.ENERGY.USAGE_RANK, num_shot=num_shots)
+                val = self.generate_fewshot_dataset_based_on_energy(path_to_energy, val, target=cfg.DATALOADER.ENERGY.USAGE_RANK, num_shot=min(num_shots, 4))
                 data = {"train": train, "val": val}
-                print(f"Saving preprocessed few-shot data to {preprocessed}")
-                with open(preprocessed, "wb") as file:
-                    pickle.dump(data, file, protocol=pickle.HIGHEST_PROTOCOL)
+            else:
+                if os.path.exists(preprocessed):
+                    print(f"Loading preprocessed few-shot data from {preprocessed}")
+                    with open(preprocessed, "rb") as file:
+                        data = pickle.load(file)
+                        train, val = data["train"], data["val"]
+                else:
+
+                    random.seed(cfg.DATASET.SAMPLE_SEED)
+
+                    # check random seed #
+                    data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+                    sample = random.sample(data, 3)
+                    print(f"When sample seed is {cfg.DATASET.SAMPLE_SEED}, choised samples are {sample}")
+                    train = self.generate_fewshot_dataset(train, num_shots=num_shots)
+                    val = self.generate_fewshot_dataset(val, num_shots=min(num_shots, 4))
+                    data = {"train": train, "val": val}
+
+                    # check path ##
+                    impaths = sorted([d.impath for d in train])
+                    for p in impaths[:3]:
+                        print(p)
+
+                    print(f"Saving preprocessed few-shot data to {preprocessed}")
+                    with open(preprocessed, "wb") as file:
+                        pickle.dump(data, file, protocol=pickle.HIGHEST_PROTOCOL)
+
+                    set_random_seed(cfg.SEED)
+
+                    # check random seed #
+                    data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+                    sample = random.sample(data, 3)
+                    print(f"When reset seed is {cfg.SEED}, choised samples are {sample}")
 
         subsample = cfg.DATASET.SUBSAMPLE_CLASSES
         train, val, test = OxfordPets.subsample_classes(train, val, test, subsample=subsample)
 
         super().__init__(train_x=train, val=val, test=test)
 
+   
     @staticmethod
     def read_and_split_data(image_dir, p_trn=0.5, p_val=0.2, ignored=[], new_cnames=None):
         # The data are supposed to be organized into the following structure
@@ -93,3 +126,6 @@ class DescribableTextures(DatasetBase):
             test.extend(_collate(images[n_train + n_val :], label, category))
 
         return train, val, test
+
+
+            

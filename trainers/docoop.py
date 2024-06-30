@@ -357,7 +357,7 @@ class DoCoOp(TrainerX):
                                         torch.cat((labels, text_labels)))
         conprox_loss *= self.cfg.TRAINER.DOCOOP.LAMBDA_CONPROX
         
-        if self.epoch >= 1000:
+        if self.epoch < self.cfg.TRAINER.DOCOOP:
             loss = cross_entropy_loss   
             self.optim.zero_grad()
             loss.backward()
