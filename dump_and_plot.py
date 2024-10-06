@@ -9,16 +9,12 @@ import matplotlib.pyplot as plt
 
 args = sys.argv
 
-#dataset = args[1]
-
 # ディレクトリ構造の基本パス
-#shots = ["shots_1","shots_2","shots_4","shots_8","shots_16"]
 shots = ["shots_1"]
 seeds = ["seed1", "seed2","seed3"]
 
-trainers = ["CoOp", "CoCoOp", "DoCoOp", "DoCoOp2", "DoCoCoOp"]
-trainers = ["CoOp", "DoCoOp"]#, "DoCoOp(one-direct-prox-conprox)"]
-trainers = ["CoOp"]
+#trainers = ["CoOp", "CoCoOp", "DoCoOp", "DoCoOp2", "DoCoCoOp"]
+trainers = ["OneShot_Adapter_Diverse"]
 
 datasets = ["eurosat", "dtd", "caltech101",
             "oxford_pets", "oxford_flowers", "fgvc_aircraft",
@@ -62,8 +58,15 @@ def main():
                 trainer = "DoCoOp"
             elif trainer == "DoCoCoOp":
                 # cfg = "vit_b16_c4_ep10_batch1_ctxv1_zhou"
-                cfg = "vit_b16_c4_ep10_batch1_ctxv1_zhou_2"
-            
+                # cfg = "vit_b16_c4_ep10_batch1_ctxv1_zhou_2"
+                cfg = "vit_b16_c4_ep10_batch1_ctxv1_zhou_active"
+            elif trainer == "OneShot_Adapter":
+                cfg = "vit_b16"
+            elif trainer == "CLIP_Adapter":
+                cfg = "vit_b16"
+            elif trainer == "OneShot_Adapter_Diverse":
+                cfg = "vit_b16"
+
             for base_path in base_paths:
                 for shot in shots:
                     accuracies = []
@@ -91,13 +94,6 @@ def main():
                 print(f"{trainer}, {shots[i]}: {round(v, 2)}")
             
             res["H"] = harmonic_means_elementwise
-
-            if cfg in "vit_b16_ctxv1_ep200_reduce_use_full_class_one_direction_prox":
-                trainer = "DoCoOp(one-direct-prox-conprox)"
-            elif cfg in "vit_b16_ctxv1_ep200_reduce_use_full_class_prox_without_dist_loss_zhou":
-                trainer = "DoCoOp"
-            elif cfg in "vit_b16_ctxv1_ep200_reduce_use_full_class_weight_adjust_zhou":
-                trainer = "DoCoOp(prev)"
 
             fullres[trainer] = res
         
@@ -156,18 +152,17 @@ def main():
     # plt.savefig(os.path.join('output', 'plots', 'accuracy_difference.png'))
 
     # Across all dataset
-    base = []
-    new = []
-    hm = []
-    for k, v in summary.items():
-        #pdb.set_trace()
-        base += [v["CoOp"]["train_base_means"][0]]
-        new += [v["CoOp"]["test_new_means"][0]]
-        hm += [v["CoOp"]["H"][0]]
-    #pdb.set_trace()
-    print(f"base: {round(np.nanmean(base),2)}, \
-            new: {round(np.nanmean(new),2)}, \
-            H:   {round(np.nanmean(hm), 2)}")
+    # base = []
+    # new = []
+    # hm = []
+    # for k, v in summary.items():
+    #     base += [v["CoOp"]["train_base_means"][0]]
+    #     new += [v["CoOp"]["test_new_means"][0]]
+    #     hm += [v["CoOp"]["H"][0]]
+    # #pdb.set_trace()
+    # print(f"base: {round(np.nanmean(base),2)}, \
+    #         new: {round(np.nanmean(new),2)}, \
+    #         H:   {round(np.nanmean(hm), 2)}")
     
     # # Rearrange and plot
     # plt.figure(figsize=(3, 5))

@@ -19,6 +19,9 @@ from sklearn.manifold import TSNE
 from scipy.sparse.csgraph import connected_components
 import matplotlib.pyplot as plt
 
+import pickle
+from tqdm import tqdm
+
 _tokenizer = _Tokenizer()
 
 
@@ -196,33 +199,39 @@ class CustomCLIP(nn.Module):
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
         self.cfg = cfg
+
+        self.first = True
         
-    def forward(self, image, label=None, embedding=False):
-        if embedding:
-            image_feature = self.image_encoder(image.type(self.dtype)) # clip visual encoder    
-            prompts = self.prompt_learner()
-            tokenized_prompts = self.tokenized_prompts
-            text_feature = self.text_encoder(prompts, tokenized_prompts)
-            return image_feature, text_feature
+    def forward(self, image, label=None, embedding=False):        
+        prompts = self.prompt_learner()
+        tokenized_prompts = self.tokenized_prompts
         
+        image_features = self.image_encoder(image.type(self.dtype))
+        text_features = self.text_encoder(prompts, tokenized_prompts)
+
+        if self.first:
+            with open(osp.join(self.cfg.OUTPUT_DIR, "txt_features_before_training.pkl"), "wb") as f:
+                pickle.dump(text_features, f)
+            self.first = False
+
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        logit_scale = self.logit_scale.exp()
+        logits = logit_scale * image_features @ text_features.t()
+
+        if label is None:
+            return logits
         else:
-            prompts = self.prompt_learner()
-            tokenized_prompts = self.tokenized_prompts
-            
-            image_features = self.image_encoder(image.type(self.dtype))
-            text_features = self.text_encoder(prompts, tokenized_prompts)
-
-            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-
-            logit_scale = self.logit_scale.exp()
-            logits = logit_scale * image_features @ text_features.t()
-
-            if label is None:
-                return logits
-            else:
-                return logits, label
+            return logits, label
     
+    def embedding(self, image):
+        image_feature = self.image_encoder(image.type(self.dtype)) # clip visual encoder    
+        prompts = self.prompt_learner()
+        tokenized_prompts = self.tokenized_prompts
+        text_feature = self.text_encoder(prompts, tokenized_prompts)
+        return image_feature, text_feature
+
 
 @TRAINER_REGISTRY.register()
 class CoOp(TrainerX):
@@ -238,7 +247,7 @@ class CoOp(TrainerX):
     def build_model(self):
         cfg = self.cfg
         classnames = self.dm.dataset.classnames
-
+        #import pdb; pdb.set_trace()
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
         
@@ -340,6 +349,54 @@ class CoOp(TrainerX):
             # set strict=False
             self._models[name].load_state_dict(state_dict, strict=False)
     
+
+    @torch.no_grad()
+    def test(self, split=None):
+        """A generic testing pipeline."""
+        self.set_model_mode("eval")
+        self.evaluator.reset()
+
+        if split is None:
+            split = self.cfg.TEST.SPLIT
+
+        if split == "val" and self.val_loader is not None:
+            data_loader = self.val_loader
+        else:
+            split = "test"  # in case val_loader is None
+            data_loader = self.test_loader
+
+        print(f"Evaluate on the *{split}* set")
+
+        img_features = []
+        img_labels = []
+        txt_features = []
+        for batch_idx, batch in enumerate(tqdm(data_loader)):
+            input, label = self.parse_batch_test(batch)
+            output = self.model_inference(input)
+            imf, txf = self.model.embedding(input)
+            img_features.append(imf.detach().cpu().numpy())
+            txt_features.append(txf.detach().cpu().numpy())
+            img_labels.append(label.detach().cpu().numpy())
+            self.evaluator.process(output, label)
+
+        with open(osp.join(self.cfg.OUTPUT_DIR, "img_features.pkl"), "wb") as f:
+            pickle.dump(img_features, f)
+
+        with open(osp.join(self.cfg.OUTPUT_DIR, "txt_features_after_training.pkl"), "wb") as f:
+            pickle.dump(txt_features, f)
+
+        with open(osp.join(self.cfg.OUTPUT_DIR, "img_labels.pkl"), "wb") as f:
+            pickle.dump(img_labels, f)
+
+        results = self.evaluator.evaluate()
+
+        for k, v in results.items():
+            tag = f"{split}/{k}"
+            self.write_scalar(tag, v, self.epoch)
+
+        return list(results.values())[0]
+
+
     def embedding_feature(self, VISUAL_MAX_NUM=2000):
         tsne = TSNE()
         tsne = umap.UMAP(random_state=42)

@@ -337,7 +337,7 @@ class DoCoOp(TrainerX):
         # ot_losses = [self.compute_transport_loss(k.unsqueeze(0), v.unsqueeze(0)) for k, v in zip(logits_scaled, logits)]
         # mi_losses = [self.compute_im_loss(k.unsqueeze(0)) for k in logits_scaled]
         
-        # if self.cfg.TRAINER.DOCOOP.ADJUST_WEIGHT:
+        # if self.cfg.TRAINER.DOCOOP.ADJUST_WEIGHT  :
         #     distribution_loss_list = list(map(lambda v: self.ot_weight * v[0] + 
         #                                 0.1 * self.ot_weight * v[1], zip(ot_losses, mi_losses)))
         # else:

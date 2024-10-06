@@ -23,6 +23,9 @@ elif [ "$TRAINER" == "DoCoCoOp" ]; then
     #CFG=vit_b16_c4_ep10_batch1_ctxv1_zhou_etran_3
     CFG=vit_b16_c4_ep10_batch1_ctxv1_zhou_active
     LOADEP=15
+elif [ "$TRAINER" == "CLIP-Adater" ]; then
+    CFG=vit_b16_c4_ep10_batch1_ctxv1_zhou_active
+    LOADEP=200
 else
     echo "Invalid TRAINER specified."
     exit 1

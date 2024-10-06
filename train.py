@@ -20,6 +20,8 @@ import datasets.imagenet
 
 import datasets.oxford_pets_active
 import datasets.eurosat_active
+import datasets.food101_active
+import datasets.ucf101_active
 
 import datasets.imagenet_sketch
 import datasets.imagenetv2
@@ -37,6 +39,10 @@ import trainers.dococoop
 import trainers.zsclip
 import trainers.etran_score
 import trainers.active
+import trainers.oneshot_adapter
+import trainers.clip_adapter
+import trainers.oneshot_adapter_augimg
+import trainers.oneshot_adapter_diverse
 
 import random
 import numpy as np

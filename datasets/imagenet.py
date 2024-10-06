@@ -52,22 +52,20 @@ class ImageNet(DatasetBase):
                     path_to_energy = pickle.load(file)
 
                 train = self.generate_fewshot_dataset_based_on_energy(path_to_energy, train, target=cfg.DATALOADER.ENERGY.USAGE_RANK, num_shot=num_shots)
-                val = self.generate_fewshot_dataset_based_on_energy(path_to_energy, val, target=cfg.DATALOADER.ENERGY.USAGE_RANK, num_shot=min(num_shots, 4))
-                data = {"train": train, "val": val}
+                data = {"train": train}
             else:
 
                 if os.path.exists(preprocessed):
                     print(f"Loading preprocessed few-shot data from {preprocessed}")
                     with open(preprocessed, "rb") as file:
                         data = pickle.load(file)
-                        train, val = data["train"], data["val"]
+                        train = data["train"]
                 else:
 
                     random.seed(cfg.DATASET.SAMPLE_SEED)
 
                     train = self.generate_fewshot_dataset(train, num_shots=num_shots)
-                    val = self.generate_fewshot_dataset(val, num_shots=min(num_shots, 4))
-                    data = {"train": train, "val": val}
+                    data = {"train": train} 
                     print(f"Saving preprocessed few-shot data to {preprocessed}")
                     with open(preprocessed, "wb") as file:
                         pickle.dump(data, file, protocol=pickle.HIGHEST_PROTOCOL)

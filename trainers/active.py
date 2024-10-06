@@ -8,6 +8,7 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import pairwise_distances
 import random
 from tqdm import tqdm
+import pickle
 
 from dassl.engine import TRAINER_REGISTRY, TrainerX
 from dassl.optim import build_optimizer, build_lr_scheduler
@@ -117,7 +118,7 @@ class ActiveLearning(TrainerX):
         preds = preds[sample_idx]
 
         # 不確実性が高い(低い？)順にソート
-        entropies_sort_ids = np.argsort(entropies)#[::-1]
+        entropies_sort_ids = np.argsort(entropies)[::-1]
 
         index_sort = indices[entropies_sort_ids]
         entropy_sort = entropies[entropies_sort_ids]
@@ -128,6 +129,70 @@ class ActiveLearning(TrainerX):
         output = {"index": index_sort[:num_samples], 
                   "preds": preds_sort[:num_samples]}
 
+        return output
+
+
+    def clustering(self, unlabeled_loader, category_size, sample_size_by_category=20):
+        
+        indices = []
+        preds = []
+        labels = []
+        entropies = []
+        img_features = []
+        
+        for batch_idx, batch in tqdm(enumerate(unlabeled_loader)):
+            index = batch["index"]
+            images = batch["img"]
+            
+            label = batch["label"]
+
+            img_feature = self.clip_model.encode_image(images.to(self.device).type(self.clip_model.dtype))
+            img_feature = img_feature.detach().cpu().numpy() # detach to avoid cuda out of memory
+            img_features.extend(img_feature)
+        
+            logits = self.model_inference(images.to(self.device).type(self.clip_model.dtype))
+            entropies.extend(e(logits.detach().cpu().numpy(), axis=1))
+            
+            preds.extend(logits.argmax(axis=1).detach().cpu().numpy())
+            indices.extend(index.numpy())
+            labels.extend(label.numpy())
+        
+        indices = np.array(indices)
+        preds = np.array(preds)
+        labels = np.array(labels)
+        entropies = np.array(entropies)
+
+        print("Save energy scores")
+        np.save(os.path.join(self.cfg.OUTPUT_DIR, "preds.npy"), preds)
+        np.save(os.path.join(self.cfg.OUTPUT_DIR, "indices.npy"), indices)
+        np.save(os.path.join(self.cfg.OUTPUT_DIR, "labels.npy"), labels)
+        np.save(os.path.join(self.cfg.OUTPUT_DIR, "entropy.npy"), entropies)
+
+        with open(os.path.join(self.cfg.OUTPUT_DIR, "img_features.pkl"), "wb") as f:
+            pickle.dump(img_features, f)
+
+        # 画像特徴量をクラスタリング
+        kmeans = KMeans(n_clusters=category_size, random_state=42)
+        img_features = np.array(img_features)
+        kmeans.fit(img_features)
+        
+        # 重心から近い順にサンプリング
+        distances = pairwise_distances(kmeans.cluster_centers_, img_features)
+        sample_idx = []
+        for d in distances:
+            d_minid = np.argsort(d)
+            d_minid = d_minid[:sample_size_by_category]
+            sample_idx.append(d_minid)
+        sample_idx = np.array(sample_idx)
+        sample_idx = np.transpose(sample_idx)
+        sample_idx = np.concatenate(sample_idx)
+        
+        indices = indices[sample_idx]
+        preds = preds[sample_idx]
+
+        output = {"index": indices,
+                  "preds": preds}
+        
         return output
 
     def entropy(self, unlabeled_loader, gamma):
@@ -198,7 +263,7 @@ class ActiveLearning(TrainerX):
         pass
 
 
-    def pseudo_labeled_balancing(self, gamma=0.4, R=1, strategy="entropy_c", sampling_mode="filled", sampling_num=None):
+    def pseudo_labeled_balancing(self, gamma=0.8, R=1, strategy="clustering", sampling_mode="filled", sampling_num=None):
 
         category_size = self.dm.num_classes
         unlabeled_loader = self.dm.train_loader_x
@@ -209,13 +274,17 @@ class ActiveLearning(TrainerX):
                 output = self.entropy(unlabeled_loader, gamma)
 
             elif strategy == "entropy_c":
-                output = self.entropy_c(unlabeled_loader, category_size, sample_size_by_category=200)
+                output = self.entropy_c(unlabeled_loader, category_size, sample_size_by_category=500)
 
             elif strategy == "random":
                 output = self.random(unlabeled_loader, gamma)
 
+            elif strategy == "clustering":
+                output = self.clustering(unlabeled_loader, category_size, sample_size_by_category=500)
+
             elif strategy == "coreset":
                 output = self.coreset()
+
             elif strategy == "badge":
                 output = self.badge
 
@@ -238,6 +307,8 @@ class ActiveLearning(TrainerX):
                     selected_id = candidates[np.random.randint(len(candidates))]
                     dataset_id = index[selected_id]
                     query.append(self.dm.dataset.train_x[dataset_id])
+                
+                return query
 
             # 全てのカテゴリにデータが含まれるまでサンプリング
             elif sampling_mode == "filled":
@@ -251,7 +322,19 @@ class ActiveLearning(TrainerX):
                         # Select one sample from candidates
                         selected_id = candidates[np.random.randint(len(candidates))]
                         dataset_id = index[selected_id]
+
+                        p_pred = np.delete(p_pred, selected_id)
+                        index = np.delete(index, selected_id)
+
                         query.append(self.dm.dataset.train_x[dataset_id])
+
+                query_uniform = []
+                for k in range(self.dm.num_classes):
+                    target_category_samples = [d for d in query if d.label == k]
+                    query_uniform.append(random.sample(target_category_samples, 1)[0])
+                #pdb.set_trace()
+
+                return query_uniform
 
 
         return query
